@@ -28,6 +28,9 @@ class CDFSquaredTimeSeriesDetector(BaseTimeSeriesDetector, timeseries_detector_n
         super().__init__(timeseries, **kwargs)
         self.start_date = start_date
         self.end_date = end_date
+        # Set in detect_changes; the length of the multiday averaging window, reused
+        # by the fast lane to locate each day's trailing baseline.
+        self._multiday_average_days = 7
 
     def _coalesce_dates(self, start_date, end_date):
         return (
@@ -67,6 +70,165 @@ class CDFSquaredTimeSeriesDetector(BaseTimeSeriesDetector, timeseries_detector_n
         differences["filtered_sq_diff"] = lowpass_filter(differences["sq_diff"], 20, 100)
 
         return differences
+
+    def _calculate_daily_differences(self):
+        """Compares each day's single-day CDF against its trailing multiday baseline.
+
+        Where `_calculate_differences` compares two `multiday_average_days` windows a
+        week apart -- and therefore cannot react until a full post-change week has
+        accumulated -- this compares the most recent single day against the trailing
+        multiday average. That lets a large shift surface the day after it lands.
+
+        :return pandas.DataFrame: The per-day differences with a `sq_diff` and `date`
+            column, one row per day that has both a single-day histogram and a
+            trailing baseline.
+        """
+        detector = CDFSquaredDetector()
+
+        by_day = self.timeseries.cumulative_by_day_histograms
+        multiday = self.timeseries.cumulative_multiday_histograms
+        window = self._multiday_average_days
+
+        # The multiday histogram labeled date D is the average of days [D, D+window-1],
+        # so the trailing baseline for `current_date` (the average of the `window` days
+        # ending the day before) is the multiday window starting `window` days earlier.
+        start_date, end_date = self._coalesce_dates(by_day["date"].min(), by_day["date"].max())
+
+        differences = pandas.DataFrame()
+        current_date = start_date
+        while current_date <= end_date:
+            baseline_date = current_date - timedelta(days=window)
+            baseline_hist = multiday[multiday["date"] == baseline_date][["bin", "cdf"]]
+            today_hist = by_day[by_day["date"] == current_date][["bin", "cdf"]]
+
+            if baseline_hist.empty or today_hist.empty:
+                current_date += timedelta(days=1)
+                continue
+
+            difference = detector.detect_changes(groups=[baseline_hist, today_hist])
+            difference["date"] = [current_date]
+            differences = pandas.concat(
+                [differences, pandas.DataFrame(difference)], ignore_index=True
+            )
+            current_date += timedelta(days=1)
+
+        return differences
+
+    def _find_fast_alerts(self, daily_differences, mad_k=6.0, min_days=14, require_confirmation=True):
+        """Flags days whose single-day diff is well outside normal daily fluctuation.
+
+        Uses a robust median + `mad_k` * MAD band to characterize "normal" daily
+        movement. MAD is used rather than the standard deviation so that the handful
+        of large regressions we are trying to catch don't inflate the band that
+        defines normality. Only deviations large enough to clear the band fire, which
+        keeps single-day sample noise from producing false positives.
+
+        A single day can also shift the whole CDF hard and then snap back the next day
+        -- a transient blip that is not a real regression, and which the band alone
+        can't distinguish from a true change (the largest single-day spikes observed
+        are often blips). When `require_confirmation` is set, a tripped day is only
+        kept if the next calendar day also trips in the same direction, so blips that
+        revert are dropped at the cost of one extra day of latency.
+
+        :param pandas.DataFrame daily_differences: Output of `_calculate_daily_differences`.
+        :param float mad_k: Number of (scaled) MADs beyond the median required to fire.
+        :param int min_days: Minimum number of days needed to estimate a stable band;
+            below this, no fast alerts are produced.
+        :param bool require_confirmation: Require the next calendar day to trip in the
+            same direction before flagging a day.
+        :return pandas.DataFrame: Flagged days with `date`, `direction`, and
+            `detection_type` columns.
+        """
+        empty = pandas.DataFrame(columns=["date", "direction", "detection_type"])
+        if daily_differences.empty or len(daily_differences) < min_days:
+            return empty
+
+        metric = daily_differences["sq_diff"].astype(float)
+        median = metric.median()
+        mad = (metric - median).abs().median()
+
+        if mad > 0:
+            # 1.4826 scales the MAD to be consistent with the standard deviation for
+            # normally distributed data, so mad_k is interpretable as "sigmas".
+            band = mad_k * 1.4826 * mad
+        else:
+            std = metric.std(ddof=0)
+            if std == 0:
+                return empty
+            band = mad_k * std
+
+        upper = median + band
+        lower = median - band
+
+        tripped = daily_differences[(metric > upper) | (metric < lower)].copy()
+        tripped["direction"] = tripped["sq_diff"].apply(lambda x: "up" if x > 0 else "down")
+
+        if require_confirmation and not tripped.empty:
+            # Keep a day only if the next calendar day tripped in the same direction.
+            # A transient one-day blip reverts the next day and is therefore dropped.
+            direction_by_date = dict(zip(tripped["date"], tripped["direction"]))
+            confirmed = tripped.apply(
+                lambda r: direction_by_date.get(r["date"] + timedelta(days=1)) == r["direction"],
+                axis=1,
+            )
+            tripped = tripped[confirmed]
+
+        if tripped.empty:
+            return empty
+
+        tripped["detection_type"] = "fast"
+        return tripped[["date", "direction", "detection_type"]].reset_index(drop=True)
+
+    def _collapse_consecutive(self, alerts, window_days):
+        """Collapses same-direction alerts within `window_days` to their earliest date.
+
+        A step change keeps firing the fast lane on consecutive days until the trailing
+        baseline absorbs the new level, so a single regression produces a run of alerts.
+        Keeping only the earliest preserves the fastest detection and drops the echoes.
+        """
+        if alerts.empty:
+            return alerts
+
+        alerts = alerts.sort_values("date").reset_index(drop=True)
+        kept = []
+        last_date_by_dir = {}
+        for _, row in alerts.iterrows():
+            direction = row["direction"]
+            prev_date = last_date_by_dir.get(direction)
+            if prev_date is not None and (row["date"] - prev_date).days <= window_days:
+                continue
+            kept.append(row)
+            last_date_by_dir[direction] = row["date"]
+        return pandas.DataFrame(kept, columns=alerts.columns).reset_index(drop=True)
+
+    def _merge_and_dedup(self, smoothed, fast, dedup_window_days):
+        """Merges smoothed and fast alerts, preferring the faster detection.
+
+        Consecutive fast alerts are first collapsed to their earliest date. A smoothed
+        alert is then dropped when a fast alert of the same direction already covers it
+        within `dedup_window_days`, since the fast lane detected the same change sooner.
+
+        :return pandas.DataFrame: The merged alerts sorted by date, with `date`,
+            `direction`, and `detection_type` columns.
+        """
+        fast = self._collapse_consecutive(fast, dedup_window_days)
+
+        if fast.empty:
+            return smoothed.sort_values("date").reset_index(drop=True)
+
+        kept_smoothed = []
+        for _, s in smoothed.iterrows():
+            covered = any(
+                s["direction"] == f["direction"]
+                and abs((f["date"] - s["date"]).days) <= dedup_window_days
+                for _, f in fast.iterrows()
+            )
+            if not covered:
+                kept_smoothed.append(s)
+
+        kept_smoothed = pandas.DataFrame(kept_smoothed, columns=smoothed.columns)
+        combined = pandas.concat([fast, kept_smoothed], ignore_index=True)
+        return combined.sort_values("date").reset_index(drop=True)
 
     def _find_alerts(self, differences, alert_threshold=0.85):
         start_date, end_date = self._coalesce_dates(
@@ -111,13 +273,24 @@ class CDFSquaredTimeSeriesDetector(BaseTimeSeriesDetector, timeseries_detector_n
                 "Cannot produce a description of the detection without a multiday average."
             )
 
-        before_histogram = self.timeseries.cumulative_multiday_histograms[
-            self.timeseries.cumulative_multiday_histograms["date"]
-            == detection["date"] - timedelta(days=7)
-        ]
-        after_histogram = self.timeseries.cumulative_multiday_histograms[
-            self.timeseries.cumulative_multiday_histograms["date"] == detection["date"]
-        ]
+        if detection.get("detection_type") == "fast":
+            # The fast lane compared the single day against its trailing baseline, so
+            # describe that same comparison: trailing multiday baseline vs. the day.
+            before_histogram = self.timeseries.cumulative_multiday_histograms[
+                self.timeseries.cumulative_multiday_histograms["date"]
+                == detection["date"] - timedelta(days=self._multiday_average_days)
+            ]
+            after_histogram = self.timeseries.cumulative_by_day_histograms[
+                self.timeseries.cumulative_by_day_histograms["date"] == detection["date"]
+            ]
+        else:
+            before_histogram = self.timeseries.cumulative_multiday_histograms[
+                self.timeseries.cumulative_multiday_histograms["date"]
+                == detection["date"] - timedelta(days=7)
+            ]
+            after_histogram = self.timeseries.cumulative_multiday_histograms[
+                self.timeseries.cumulative_multiday_histograms["date"] == detection["date"]
+            ]
 
         merged_hist = pandas.merge(
             before_histogram, after_histogram, on="bin", suffixes=("_current", "_next")
@@ -171,6 +344,10 @@ class CDFSquaredTimeSeriesDetector(BaseTimeSeriesDetector, timeseries_detector_n
         logger.debug(table)
 
         detection_dict = {d[0]: d[1:] for d in detection_info}
+
+        # Record which lane produced this detection ("fast" or "smoothed") so
+        # downstream consumers can tell a next-day alert from a smoothed one.
+        detection_dict["detection_type"] = detection.get("detection_type", "smoothed")
 
         # Store data representing the data before and after the detection
         detection_dict["additional_data"] = {
@@ -255,23 +432,68 @@ class CDFSquaredTimeSeriesDetector(BaseTimeSeriesDetector, timeseries_detector_n
         plt.close()
         return img_str
 
-    def detect_changes(self, multiday_average_days=7, alert_threshold=0.85, **kwargs):
+    def detect_changes(
+        self,
+        multiday_average_days=7,
+        alert_threshold=0.85,
+        fast_detection=True,
+        fast_mad_k=6.0,
+        fast_confirm=True,
+        dedup_window_days=None,
+        **kwargs,
+    ):
         """Detects changes in a telemetry probe using the CDF squared detection method.
 
+        Runs two lanes. The smoothed lane compares two `multiday_average_days` windows a
+        week apart, maximizing sensitivity to gradual shifts while rejecting daily noise,
+        but it cannot react until a full post-change week accumulates. The fast lane
+        compares the most recent single day against its trailing baseline and fires only
+        when the change is well outside normal daily fluctuation, letting large
+        regressions be caught the day after they land. Fast detections are preferred over
+        the smoothed detection of the same change during deduplication.
+
         :param int multiday_average_days: The number of days to use in the multiday average.
+        :param float alert_threshold: Quantile threshold for the smoothed lane's peaks.
+        :param bool fast_detection: Whether to run the fast (next-day) lane.
+        :param float fast_mad_k: How many scaled MADs beyond the median a single-day diff
+            must be for the fast lane to fire. Higher is more conservative.
+        :param bool fast_confirm: Require the day after a fast trip to shift in the same
+            direction before alerting. Suppresses transient one-day blips at the cost of
+            one extra day of latency.
+        :param int dedup_window_days: Window (in days) within which same-direction alerts
+            are collapsed and a fast alert supersedes a smoothed one. Defaults to
+            `multiday_average_days`.
 
         :return list: A list of Detection objects representing where a detection occurred.
         """
+        self._multiday_average_days = multiday_average_days
+        if dedup_window_days is None:
+            dedup_window_days = multiday_average_days
+
         self.timeseries.get_cumulative_by_day(start_date=self.start_date, end_date=self.end_date)
         self.timeseries.get_multiday_average(days=multiday_average_days)
 
         differences = self._calculate_differences()
         pre_detections = self._find_alerts(differences, alert_threshold=alert_threshold)
+        pre_detections = pre_detections.assign(detection_type="smoothed")
+
+        if fast_detection:
+            daily_differences = self._calculate_daily_differences()
+            fast_detections = self._find_fast_alerts(
+                daily_differences, mad_k=fast_mad_k, require_confirmation=fast_confirm
+            )
+            pre_detections = self._merge_and_dedup(
+                pre_detections, fast_detections, dedup_window_days
+            )
 
         detections = []
         for i in range(len(pre_detections)):
             detection = pre_detections.iloc[i]
-            detection_info = self._describe_detection(detection)
+            try:
+                detection_info = self._describe_detection(detection)
+            except Exception as e:
+                logger.warning(f"Failed to describe detection on {detection['date']}: {e}")
+                continue
 
             detections.append(
                 Detection(
