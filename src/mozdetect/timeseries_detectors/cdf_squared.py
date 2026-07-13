@@ -114,7 +114,9 @@ class CDFSquaredTimeSeriesDetector(BaseTimeSeriesDetector, timeseries_detector_n
 
         return differences
 
-    def _find_fast_alerts(self, daily_differences, mad_k=6.0, min_days=14, require_confirmation=True):
+    def _find_fast_alerts(
+        self, daily_differences, mad_k=6.0, min_days=14, require_confirmation=True
+    ):
         """Flags days whose single-day diff is well outside normal daily fluctuation.
 
         Uses a robust median + `mad_k` * MAD band to characterize "normal" daily

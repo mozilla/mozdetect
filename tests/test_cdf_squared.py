@@ -244,9 +244,7 @@ def _build_step_change_timeseries(step_index=28, ndays=40, seed=0):
         build_id = day.strftime("%Y%m%d") + "10"  # 10 chars -> parsed as %Y%m%d%H
         base_center = 8.0 if i < step_index else 20.0
         center = base_center + rng.normal(0, 0.05)  # small daily jitter
-        rows.append(
-            {"build_id": build_id, "non_norm_histogram": json.dumps(_histogram(center))}
-        )
+        rows.append({"build_id": build_id, "non_norm_histogram": json.dumps(_histogram(center))})
     return TelemetryTimeSeries(pandas.DataFrame(rows))
 
 
@@ -295,6 +293,4 @@ def test_detect_changes_without_fast_lane_has_no_fast_detections():
     detector = _get_detector(ts)
     detections = detector.detect_changes(fast_detection=False)
 
-    assert all(
-        d.optional_detection_info.get("detection_type") != "fast" for d in detections
-    )
+    assert all(d.optional_detection_info.get("detection_type") != "fast" for d in detections)
