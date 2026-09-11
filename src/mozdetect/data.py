@@ -372,3 +372,120 @@ class TelemetryTimeSeries(TimeSeries):
             date_to_add += timedelta(days=1)
 
         return self.cumulative_multiday_histograms
+
+
+class TreeherderTimeSeries(TimeSeries):
+    """Provides additional Perfherder-specific methods, and exposes the
+    raw data in the `raw_data` attribute to provide more customization.
+
+    Built with a table from `mozdetect.get_signature_table`. The signature's
+    metadata is exposed here as `metadata`.
+    """
+
+    def __init__(self, data, *args, **kwargs):
+        super().__init__(data, *args, **kwargs)
+        self.raw_data = data
+        self.metadata = dict(getattr(data, "attrs", None) or {})
+        self.by_day = pandas.DataFrame()
+        self.multiday = pandas.DataFrame()
+
+    @property
+    def lower_is_better(self):
+        """Whether a drop in this signature's values is an improvement."""
+        return self.metadata.get("lower_is_better", True)
+
+    @property
+    def alert_threshold(self):
+        """How much the signature has to move before the change matters, as set
+        by the test itself. None when the test hasn't made that judgement.
+        """
+        return self.metadata.get("alert_threshold")
+
+    @property
+    def measurement_unit(self):
+        return self.metadata.get("measurement_unit") or ""
+
+    @property
+    def revisions(self):
+        """Returns a mapping of push ID to revision.
+
+        A detection is identified by its revision, which is what a sheriff
+        looks the change up by.
+        """
+        if "revision" not in self.raw_data:
+            return {}
+        return dict(zip(self.raw_data["push_id"], self.raw_data["revision"]))
+
+    def get_trials(self, rows=None):
+        """Returns the individual measurements in the given rows, as a flat list.
+
+        :param pandas.DataFrame rows: The rows to pull measurements from, such
+            as a window from `get_previous_n`. Defaults to the whole series.
+
+        :return list: The measurements the given rows recorded.
+        """
+        if rows is None:
+            rows = self.raw_data
+
+        return [value for trials in rows["trials"] for value in trials]
+
+    def get_by_day(self):
+        """Returns the data downsampled into a per-day granularity.
+
+        :return pandas.DataFrame: A pandas.DataFrame of the measurements pooled
+            at a per-day granularity, ordered oldest first. Can also be obtained
+            from `self.by_day`.
+        """
+        rows = []
+        for date, group in self.raw_data.groupby(
+            self.raw_data["push_timestamp"].dt.date, sort=True
+        ):
+            trials = self.get_trials(group)
+            rows.append(
+                {
+                    "date": date,
+                    "value": np.median(trials),
+                    "mean": np.mean(trials),
+                    "trials": trials,
+                    "push_count": group["push_id"].nunique(),
+                    "trial_count": len(trials),
+                }
+            )
+
+        self.by_day = pandas.DataFrame(rows).reset_index(drop=True)
+        return self.by_day
+
+    def get_multiday_average(self, days=7):
+        """Produces a multiday average of the per-day measurements using a
+        rolling window.
+
+        Each row holds every measurement the `days` days up to and including
+        its date recorded.
+
+        :param int days: The number of days to pool together.
+
+        :return pandas.DataFrame: The data with each point covering `days` days
+            instead of only a single day. Can also be obtained from
+            `self.multiday`.
+        """
+        if self.by_day.empty:
+            self.get_by_day()
+
+        rows = []
+        for end in range(days - 1, len(self.by_day)):
+            window = self.by_day.iloc[end - days + 1 : end + 1]
+            trials = [value for trials in window["trials"] for value in trials]
+
+            rows.append(
+                {
+                    "date": window["date"].iloc[-1],
+                    "value": np.median(trials),
+                    "mean": np.mean(trials),
+                    "trials": trials,
+                    "push_count": int(window["push_count"].sum()),
+                    "trial_count": len(trials),
+                }
+            )
+
+        self.multiday = pandas.DataFrame(rows).reset_index(drop=True)
+        return self.multiday

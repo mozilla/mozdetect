@@ -13,6 +13,7 @@ Then read its series:
 """
 import argparse
 
+from mozdetect.data import TreeherderTimeSeries
 from mozdetect.treeherder_query import (
     DEFAULT_DAYS,
     DEFAULT_SERVER,
@@ -126,7 +127,9 @@ def read_series(args):
         to_date=args.to_date,
         per_push=not args.no_per_push,
     )
-    metadata = series.attrs
+
+    timeseries = TreeherderTimeSeries(series)
+    metadata = timeseries.metadata
 
     print(
         f"{metadata.get('name') or metadata['signature_hash']} on {metadata['platform']} "
@@ -134,9 +137,9 @@ def read_series(args):
         f"signature {metadata['signature_id']})"
     )
     print(
-        f"lower_is_better={metadata['lower_is_better']}, "
-        f"alert_threshold={metadata.get('alert_threshold')}, "
-        f"unit={metadata.get('measurement_unit') or 'n/a'}"
+        f"lower_is_better={timeseries.lower_is_better}, "
+        f"alert_threshold={timeseries.alert_threshold}, "
+        f"unit={timeseries.measurement_unit or 'n/a'}"
     )
 
     if not args.no_per_push:
@@ -151,11 +154,7 @@ def read_series(args):
             ].to_string(index=False)
         )
     else:
-        trials = (
-            len(series)
-            if args.no_replicates
-            else sum(len(replicates) for replicates in series["replicates"])
-        )
+        trials = sum(len(trials) for trials in series["trials"])
         print(
             f"{series['push_id'].nunique()} pushes, {len(series)} data points, {trials} trials"
             f"{' (replicates off)' if args.no_replicates else ''}"

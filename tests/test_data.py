@@ -2,9 +2,17 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+import pandas
 import pytest
 
-from mozdetect.data import InvalidNumberError, TimeSeries, UnknownDataTypeError
+from mozdetect.data import (
+    InvalidNumberError,
+    TimeSeries,
+    TreeherderTimeSeries,
+    UnknownDataTypeError,
+)
+
+from .support import get_sample_treeherder_data
 
 
 def test_data():
@@ -106,3 +114,134 @@ def test_data_set_data_type_failues():
 
     with pytest.raises(UnknownDataTypeError):
         ts.set_data_type(["not a type"])
+
+
+def test_treeherder_data_metadata():
+    ts = get_sample_treeherder_data()
+
+    assert ts.metadata["signature_id"] == 298906
+    assert ts.lower_is_better is True
+    assert ts.alert_threshold == 2.0
+    assert ts.measurement_unit == "ms"
+    assert ts.revisions == {
+        100: "revision100",
+        101: "revision101",
+        102: "revision102",
+        103: "revision103",
+    }
+
+    # The raw data is exposed for anything the helpers don't cover.
+    assert len(ts.raw_data) == 4
+    assert (ts.data == ts.raw_data).all().all()
+
+
+def test_treeherder_data_metadata_missing():
+    ts = get_sample_treeherder_data(metadata={})
+
+    # A signature that hasn't set a threshold has no floor at all, and
+    # lower_is_better is almost always true.
+    assert ts.metadata == {}
+    assert ts.lower_is_better is True
+    assert ts.alert_threshold is None
+    assert ts.measurement_unit == ""
+
+
+def test_treeherder_data_get_trials():
+    ts = get_sample_treeherder_data()
+
+    assert ts.get_trials() == [10.0, 12.0, 11.0, 13.0, 20.0, 22.0, 30.0, 32.0]
+
+    # A window of the series, as a detector would ask for it.
+    ts._currind = 2
+    assert ts.get_trials(ts.get_previous_n(2)) == [10.0, 12.0, 11.0, 13.0]
+    assert ts.get_trials(ts.get_next_n(1, inclusive=True)) == [20.0, 22.0]
+
+
+def test_treeherder_data_get_trials_per_data_point():
+    # A per-data-point table holds the measurements in the same column.
+    df = pandas.DataFrame(
+        [
+            {
+                "push_id": 100,
+                "push_timestamp": pandas.Timestamp("2026-09-01T01:00:00"),
+                "revision": "revision100",
+                "value": 10.0,
+                "trials": [9.0, 11.0],
+            },
+            {
+                "push_id": 100,
+                "push_timestamp": pandas.Timestamp("2026-09-01T01:00:00"),
+                "revision": "revision100",
+                "value": 12.0,
+                "trials": [12.0],
+            },
+        ]
+    )
+    ts = TreeherderTimeSeries(df)
+
+    assert ts.get_trials() == [9.0, 11.0, 12.0]
+    # Both rows sit on the same push, so they pool into one point.
+    by_day = ts.get_by_day()
+    assert len(by_day) == 1
+    assert by_day["trials"].iloc[0] == [9.0, 11.0, 12.0]
+    assert by_day["push_count"].iloc[0] == 1
+
+
+def test_treeherder_data_get_trials_without_replicates():
+    # Read with replicates off, the aggregated value stands in for them.
+    df = pandas.DataFrame(
+        [
+            {
+                "push_id": 100,
+                "push_timestamp": pandas.Timestamp("2026-09-01T01:00:00"),
+                "revision": "revision100",
+                "value": 10.0,
+                "trials": [10.0],
+            }
+        ]
+    )
+    ts = TreeherderTimeSeries(df)
+
+    assert ts.get_trials() == [10.0]
+
+
+def test_treeherder_data_get_by_day():
+    ts = get_sample_treeherder_data()
+
+    by_day = ts.get_by_day()
+
+    assert [str(date) for date in by_day["date"]] == [
+        "2026-09-01",
+        "2026-09-02",
+        "2026-09-03",
+    ]
+    # The two pushes on the first day pool together.
+    assert list(by_day["value"]) == [11.5, 21.0, 31.0]
+    assert list(by_day["push_count"]) == [2, 1, 1]
+    assert list(by_day["trial_count"]) == [4, 2, 2]
+    assert by_day["trials"].iloc[0] == [10.0, 12.0, 11.0, 13.0]
+
+    # It's also kept on the timeseries.
+    assert (ts.by_day == by_day).all().all()
+
+
+def test_treeherder_data_get_multiday_average():
+    ts = get_sample_treeherder_data()
+
+    multiday = ts.get_multiday_average(days=2)
+
+    # Only full windows, each labelled by the last day it covers.
+    assert [str(date) for date in multiday["date"]] == ["2026-09-02", "2026-09-03"]
+    assert list(multiday["value"]) == [12.5, 26.0]
+    assert list(multiday["push_count"]) == [3, 2]
+    assert list(multiday["trial_count"]) == [6, 4]
+    assert (ts.multiday == multiday).all().all()
+
+    # The per-day data it builds on is calculated if it wasn't already.
+    assert not ts.by_day.empty
+
+
+def test_treeherder_data_get_multiday_average_not_enough_days():
+    ts = get_sample_treeherder_data()
+
+    assert ts.get_multiday_average(days=7).empty
