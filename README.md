@@ -60,6 +60,18 @@ gcloud config set project mozdata
 
 The key things to do in the script are calling `get_metric_table` to get the data, creating a `TelemetryTimeSeries` with the data, and then calling the change detection technique with the timeseries object as an argument. The change detection technique class is obtained from `mozdetect.get_timeseries_detectors()["name-of-detector"]` (name of the detector is given when creating the detector class). Calling `detect_changes()` on the resulting object will trigger the change detection, and return a list of `Detection` objects that describe the change that was detected.
 
+### Perfherder Data
+
+Timeseries data from Perfherder can be pulled from a Treeherder API server with `mozdetect.treeherder_query`, which works the same way as `telemetry_query` does for BigQuery, minus the login: the data is public and nothing is written, so it can be pointed at production from anywhere.
+
+Use `get_signatures` to help with finding series with specific characteristics, and `get_signature_table` to get the data for that series. The table holds one row per data point, with the replicates behind each point in a `replicates` column. The signature's metadata (e.g. `lower_is_better`, `alert_threshold`, etc.) are found on the frame's `attrs`. Since change detection usually works over pushes rather than jobs, and a push can hold several data points for the same signature (retriggers or backfills), the data is aggregated to have one row per push with all retriggers combined in them. Pass `per_push=False` to disable that behaviour.
+
+See `examples/treeherder_query_run.py` for a script that does both, which can be run using the following from the top-level of the repo:
+```
+uv run examples/treeherder_query_run.py --project autoland --list --suite pdfpaint
+uv run examples/treeherder_query_run.py --project autoland --signature <hash or id>
+```
+
 ### Using New Techniques in Alerting/Monitoring
 
 Once a new technique is added, a new release of mozdetect will need to be produced. From there, an update in Treeherder will be needed for the mozdetect package along with a new deployment. Once deployed, it will be usable.

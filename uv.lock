@@ -863,6 +863,7 @@ dependencies = [
     { name = "prettytable" },
     { name = "pyqt5" },
     { name = "pyqt5-qt5" },
+    { name = "requests" },
     { name = "scipy" },
 ]
 
@@ -881,6 +882,7 @@ requires-dist = [
     { name = "prettytable", specifier = ">=3.11.0" },
     { name = "pyqt5", specifier = ">=5.15.11" },
     { name = "pyqt5-qt5", specifier = ">=5.15.2" },
+    { name = "requests", specifier = ">=2.32.3" },
     { name = "scipy", specifier = ">=1.10.1" },
 ]
 

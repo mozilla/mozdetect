@@ -15,6 +15,7 @@ dependencies = [
     "matplotlib>=3.7.5",
     "pyqt5>=5.15.11",
     "pyqt5-qt5>=5.15.2",
+    "requests>=2.32.3",
 ]
 
 [build-system]
