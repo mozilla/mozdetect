@@ -7,6 +7,7 @@ from pkgutil import iter_modules
 from pathlib import Path
 from importlib import import_module
 
+from mozdetect.detectors.base import DEFAULT_DETECTOR_TYPE
 from mozdetect.timeseries_detectors.base import TimeSeriesDetectorRegistry
 
 # Import all the classes from this submodule. This causes the subclass
@@ -23,5 +24,11 @@ for _, module_name, _ in iter_modules([str(package_dir)]):
             globals()[attribute_name] = attribute
 
 
-def get_timeseries_detectors():
-    return TimeSeriesDetectorRegistry.get_timeseries_detectors()
+def get_timeseries_detectors(detector_type=DEFAULT_DETECTOR_TYPE):
+    """Return the timeseries detectors that were gathered for a kind of data.
+
+    :param str detector_type: The kind of data to return the timeseries
+        detectors of, either "telemetry" or "ci". Defaults to the telemetry
+        timeseries detectors.
+    """
+    return TimeSeriesDetectorRegistry.get_timeseries_detectors(detector_type)

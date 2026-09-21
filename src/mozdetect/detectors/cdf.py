@@ -7,7 +7,7 @@ import numpy as np
 from mozdetect.detectors.base import BaseDetector
 
 
-class CDFDetector(BaseDetector, detector_name="cdf"):
+class CDFDetector(BaseDetector, detector_name="cdf", detector_type="telemetry"):
     """Uses the CDF of two groups of histograms to detect changes."""
 
     def _calculate_cdf(self, group):

@@ -6,7 +6,7 @@ from pkgutil import iter_modules
 from pathlib import Path
 from importlib import import_module
 
-from mozdetect.detectors.base import DetectorRegistry
+from mozdetect.detectors.base import DEFAULT_DETECTOR_TYPE, DetectorRegistry
 
 # Import all the classes from this submodule. This causes the subclass
 # initialization that populates the DetectorRegistry.
@@ -22,5 +22,10 @@ for _, module_name, _ in iter_modules([str(package_dir)]):
             globals()[attribute_name] = attribute
 
 
-def get_detectors():
-    return DetectorRegistry.get_detectors()
+def get_detectors(detector_type=DEFAULT_DETECTOR_TYPE):
+    """Return the detectors that were gathered for a kind of data.
+
+    :param str detector_type: The kind of data to return the detectors of,
+        either "telemetry" or "ci". Defaults to the telemetry detectors.
+    """
+    return DetectorRegistry.get_detectors(detector_type)

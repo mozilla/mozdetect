@@ -8,7 +8,9 @@ from mozdetect.timeseries_detectors.detection import Detection
 from mozdetect.utils import is_dev_mode
 
 
-class CDFTimeSeriesDetector(BaseTimeSeriesDetector, timeseries_detector_name="cdf"):
+class CDFTimeSeriesDetector(
+    BaseTimeSeriesDetector, timeseries_detector_name="cdf", detector_type="telemetry"
+):
     """Analyzes a time series of histograms using CDFs to detect changes."""
 
     def detect_changes(self, group_size=7, alert_threshold=0.1, **kwargs):
