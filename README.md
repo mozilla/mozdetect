@@ -41,7 +41,14 @@ All techniques are defined in two parts. The first part is the detector itself t
 
 Both of these should be defined for any new techniques. This makes it possible to make different timeseries detectors using the same underlying detector technique. See `src/mozdetect/detectors/cdf_squared.py` for an example implementation of a detector, and `src/mozdetect/detectors/cdf_squared.py` for an example implementation of the timeseries detector. Note that the detectors will need to be subclasses of the `BaseDetector`, and `BaseTimeSeriesDetector`, respectively. Furthermore, they need to specify a name that will be used to access them, e.g. `cdf_squared`, through the `detector_name`, and `timeseries_detector_name` class initialization arguments. These names will be used to access the detectors from the return value of `get_detectors`/`get_timeseries_detectors`.
 
-The `TelemetryTimeSeries` object provides an interface for accessing the data with some helper methods. However, if those are not enough, it's possible to access the raw data that the time series object was built with through `TelemetryTimeSeries.raw_data`.
+Detectors also specify the kind of data they're for through the `detector_type` class initialization argument, since a technique is written against the shape of its data: `telemetry` for the per-build histograms of a probe, and `ci` for the per-push runs of a CI test. It defaults to `telemetry`, which is also the set `get_detectors`/`get_timeseries_detectors` return when they're not asked for one, so a caller has to ask for the other kind explicitly:
+```python
+mozdetect.get_timeseries_detectors()  # the telemetry techniques
+mozdetect.get_timeseries_detectors("ci")  # the CI ones
+```
+The two sets are kept apart rather than merged, so a name means one technique for one kind of data, and asking for a type that doesn't exist raises `UnknownDetectorTypeError` rather than giving back an empty set.
+
+The `TelemetryTimeSeries` object provides an interface for accessing the data with some helper methods. However, if those are not enough, it's possible to access the raw data that the time series object was built with through `TelemetryTimeSeries.raw_data`. The same is true for `TreeherderTimeSeries` objects.
 
 The detector only needs to return a dictionary with information about the comparison. However, the timeseries detector must return a list of `Detection` objects that contain information about the changes detected.
 

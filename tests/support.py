@@ -54,3 +54,32 @@ def get_sample_treeherder_data(metadata=SAMPLE_SIGNATURE_METADATA):
     )
     df.attrs = dict(metadata)
     return TreeherderTimeSeries(df)
+
+
+def make_treeherder_timeseries(trials_per_push, metadata=SAMPLE_SIGNATURE_METADATA):
+    """Builds a TreeherderTimeSeries out of the measurements of each push.
+
+    :param list trials_per_push: The measurements each push recorded, oldest
+        push first.
+    :param dict metadata: The signature metadata the series carries.
+
+    :return TreeherderTimeSeries: The series, one row per push.
+    """
+    start = pandas.Timestamp("2026-09-01T00:00:00")
+    df = pandas.DataFrame(
+        [
+            {
+                "push_id": 1000 + index,
+                "push_timestamp": start + pandas.Timedelta(hours=index),
+                "revision": f"revision{1000 + index}",
+                "value": pandas.Series(trials).median(),
+                "values": [pandas.Series(trials).median()],
+                "trials": list(trials),
+                "value_count": 1,
+                "trial_count": len(trials),
+            }
+            for index, trials in enumerate(trials_per_push)
+        ]
+    )
+    df.attrs = dict(metadata)
+    return TreeherderTimeSeries(df)
