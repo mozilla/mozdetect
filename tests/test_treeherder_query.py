@@ -515,3 +515,39 @@ def test_treeherder_query_fields_are_exported():
     assert REPLICATE_FIELD in QUERY_FIELDS
     assert set(QUERY_FIELDS) >= set(REQUIRED_DATUM_FIELDS)
     assert list(QUERY_ROWS[0]) == list(QUERY_FIELDS)
+
+
+def test_treeherder_query_from_query_orders_like_the_api():
+    # A query with no ordering of its own still gives the series back the way
+    # the API server reports it: oldest push first, and by job within a push.
+    scrambled = [
+        _joined_row(3, 101, 13.0, "2026-09-04T15:00:00", job_id=2),
+        _joined_row(2, 101, 11.0, "2026-09-04T15:00:00", replicate=11.5),
+        _joined_row(1, 100, 10.0, "2026-09-04T13:47:53", replicate=11.0),
+        _joined_row(2, 101, 11.0, "2026-09-04T15:00:00", replicate=10.5),
+        _joined_row(1, 100, 10.0, "2026-09-04T13:47:53", replicate=9.0),
+    ]
+
+    result = get_signature_table_from_query(scrambled, QUERY_SIGNATURE, per_push=False)
+
+    assert list(result["push_id"]) == [100, 101, 101]
+    assert list(result["job_id"]) == [1, 1, 2]
+    # The replicates keep the order the query returned them in.
+    assert list(result["trials"]) == [[11.0, 9.0], [11.5, 10.5], [13.0]]
+
+    # And the measurements land in that same order once collapsed by push.
+    pushes = get_signature_table_from_query(scrambled, QUERY_SIGNATURE)
+    assert list(pushes["trials"]) == [[11.0, 9.0], [11.5, 10.5, 13.0]]
+
+
+def test_treeherder_query_from_query_orders_expired_jobs_last():
+    # A data point whose job has expired has no job to sort on.
+    rows = [
+        _joined_row(2, 100, 11.0, "2026-09-04T13:47:53", job_id=None),
+        _joined_row(1, 100, 10.0, "2026-09-04T13:47:53", job_id=7),
+    ]
+
+    result = get_signature_table_from_query(rows, QUERY_SIGNATURE, per_push=False)
+
+    assert list(result["datum_id"]) == [1, 2]
+    assert list(result["value"]) == [10.0, 11.0]

@@ -363,13 +363,19 @@ def _finalize_table(result, metadata, per_push):
     :param dict metadata: The signature metadata to carry on `attrs`.
     :param bool per_push: Whether to collapse the table to one row per push.
 
-    :return pandas.DataFrame: The table, ordered oldest first.
+    :return pandas.DataFrame: The table, ordered oldest first and by job
+        within a push.
     """
     result["push_timestamp"] = pandas.to_datetime(result["push_timestamp"])
     if "submit_time" in result:
         result["submit_time"] = pandas.to_datetime(result["submit_time"])
 
-    result = result.sort_values(by=["push_timestamp", "push_id"]).reset_index(drop=True)
+    # The job breaks the tie between the rows of one push, which is how the API
+    # server orders its own rows, so both entry points hand the same series back
+    # in the same order rather than in whatever order the query yielded. A data
+    # point whose job has expired sorts last.
+    order = [column for column in ("push_timestamp", "push_id", "job_id") if column in result]
+    result = result.sort_values(by=order).reset_index(drop=True)
     result.attrs = metadata
 
     if per_push:
@@ -415,8 +421,9 @@ def get_signature_table_from_query(datums, signature=None, per_push=True):
         On by default, since change detection works over pushes, not jobs.
 
     :return pandas.DataFrame: The series, ordered oldest first. One row per push,
-        or one row per data point when `per_push` is off. A query that selected
-        nothing gives an empty table that still carries the usual columns.
+        or one row per data point, ordered by job within each push, when
+        `per_push` is off. A query that selected nothing gives an empty table
+        that still carries the usual columns.
     """
     rows = {}
     for datum in datums:
@@ -517,7 +524,8 @@ def get_signature_table(
         On by default, since change detection works over pushes, not jobs.
 
     :return pandas.DataFrame: The series, ordered oldest first. One row per push,
-        or one row per data point when `per_push` is off.
+        or one row per data point, ordered by job within each push, when
+        `per_push` is off.
     """
     TreeherderClient(server=server)
 
