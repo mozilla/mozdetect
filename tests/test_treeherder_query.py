@@ -2,13 +2,21 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+import mozdetect
 import pytest
+from collections import namedtuple
+from datetime import datetime
 from unittest import mock
 
+from mozdetect.data import TreeherderTimeSeries
 from mozdetect.treeherder_query import (
     MultipleSignaturesError,
+    QUERY_FIELDS,
+    REPLICATE_FIELD,
+    REQUIRED_DATUM_FIELDS,
     TreeherderQueryError,
     get_signature_table,
+    get_signature_table_from_query,
     get_signatures,
 )
 
@@ -297,3 +305,213 @@ def test_treeherder_query_per_push_without_replicates(mocked_th_client):
 
     assert list(pushes["values"]) == [[10.0], [11.0, 13.0]]
     assert list(pushes["trials"]) == [[10.0], [11.0, 13.0]]
+
+
+def _joined_row(datum_id, push_id, value, push_timestamp, replicate=None, job_id=1):
+    """Returns one row of the query, as `values()` hands it back.
+
+    The data point's own fields repeat across the rows its replicates were
+    joined onto, and the replicate value is null for a job that reported none.
+    """
+    return {
+        "id": datum_id,
+        "job_id": job_id,
+        "push_id": push_id,
+        "push_timestamp": datetime.fromisoformat(push_timestamp),
+        "push__revision": f"revision{push_id}",
+        "value": value,
+        "performancedatumreplicate__value": replicate,
+    }
+
+
+# Two data points with replicates, and a retrigger on the second push that
+# reported none.
+QUERY_ROWS = [
+    _joined_row(1, 100, 10.0, "2026-09-04T13:47:53", replicate=9.0),
+    _joined_row(1, 100, 10.0, "2026-09-04T13:47:53", replicate=11.0),
+    _joined_row(2, 101, 11.0, "2026-09-04T15:00:00", replicate=10.5),
+    _joined_row(2, 101, 11.0, "2026-09-04T15:00:00", replicate=11.5),
+    _joined_row(3, 101, 13.0, "2026-09-04T15:00:00", job_id=2),
+]
+
+# A series whose jobs never reported replicates: the join leaves every
+# replicate value null, and each data point arrives once.
+UNREPLICATED_ROWS = [
+    _joined_row(1, 100, 10.0, "2026-09-04T13:47:53"),
+    _joined_row(2, 101, 11.0, "2026-09-04T15:00:00"),
+    _joined_row(3, 101, 13.0, "2026-09-04T15:00:00", job_id=2),
+]
+
+# The signature's own fields, as a bare `values()` query hands them back:
+# its own columns, with the related rows reported as the ids they are.
+QUERY_SIGNATURE = {
+    "id": 298906,
+    "signature_hash": SIGNATURE_HASH,
+    "framework_id": 1,
+    "repository_id": 77,
+    "platform_id": 831,
+    "suite": "rasterflood_svg",
+    # A summary signature has no test of its own.
+    "test": "",
+    "has_subtests": False,
+    "lower_is_better": True,
+    "alert_threshold": 2.0,
+    "alert_change_type": None,
+    "measurement_unit": "ms",
+    "should_alert": True,
+}
+
+
+def test_treeherder_query_from_query():
+    pushes = get_signature_table_from_query(QUERY_ROWS, QUERY_SIGNATURE)
+
+    assert list(pushes["push_id"]) == [100, 101]
+    # The data point's value is counted once, not once per replicate.
+    assert list(pushes["values"]) == [[10.0], [11.0, 13.0]]
+    # The retrigger without replicates falls back to its aggregated value.
+    assert list(pushes["trials"]) == [[9.0, 11.0], [10.5, 11.5, 13.0]]
+    assert list(pushes["revision"]) == ["revision100", "revision101"]
+    assert list(pushes["value"]) == [10.0, 11.5]
+    assert list(pushes["value_count"]) == [1, 2]
+    assert list(pushes["trial_count"]) == [2, 3]
+
+
+def test_treeherder_query_from_query_without_replicates():
+    # Every data point falls back to the aggregated value it recorded.
+    pushes = get_signature_table_from_query(UNREPLICATED_ROWS, QUERY_SIGNATURE)
+
+    assert list(pushes["values"]) == [[10.0], [11.0, 13.0]]
+    assert list(pushes["trials"]) == [[10.0], [11.0, 13.0]]
+    assert list(pushes["trial_count"]) == [1, 2]
+
+
+def test_treeherder_query_from_query_per_datum():
+    result = get_signature_table_from_query(QUERY_ROWS, QUERY_SIGNATURE, per_push=False)
+
+    assert list(result.columns) == [
+        "datum_id",
+        "job_id",
+        "push_id",
+        "push_timestamp",
+        "revision",
+        "value",
+        "trials",
+    ]
+    # One row per data point, however many rows it was joined across.
+    assert list(result["datum_id"]) == [1, 2, 3]
+    assert list(result["job_id"]) == [1, 1, 2]
+    assert list(result["value"]) == [10.0, 11.0, 13.0]
+    assert list(result["trials"]) == [[9.0, 11.0], [10.5, 11.5], [13.0]]
+
+
+def test_treeherder_query_from_query_metadata():
+    pushes = get_signature_table_from_query(QUERY_ROWS, QUERY_SIGNATURE)
+
+    # Everything the signature carries travels as it stands.
+    assert pushes.attrs == QUERY_SIGNATURE
+    # It isn't the caller's dict, so writing to one can't reach the other.
+    assert pushes.attrs is not QUERY_SIGNATURE
+
+    # Which is what a timeseries reads its signature from.
+    timeseries = TreeherderTimeSeries(pushes)
+    assert timeseries.lower_is_better is True
+    assert timeseries.alert_threshold == 2.0
+    assert timeseries.measurement_unit == "ms"
+
+
+def test_treeherder_query_from_query_metadata_selected_fields():
+    # A query that picked out fields, related names included, is taken the
+    # same way: under the names it selected them with.
+    signature = {
+        "id": 12,
+        "suite": "pdfpaint",
+        "test": "xfa_bug1718521_3.pdf",
+        "platform__platform": "linux2404-64",
+        "lower_is_better": False,
+    }
+    pushes = get_signature_table_from_query(QUERY_ROWS, signature)
+
+    assert pushes.attrs == signature
+    assert TreeherderTimeSeries(pushes).lower_is_better is False
+    # Nothing was selected for these.
+    assert TreeherderTimeSeries(pushes).alert_threshold is None
+    assert TreeherderTimeSeries(pushes).measurement_unit == ""
+
+
+def test_treeherder_query_from_query_no_signature():
+    assert get_signature_table_from_query(QUERY_ROWS).attrs == {}
+
+
+def test_treeherder_query_from_query_rejects_other_row_formats():
+    Row = namedtuple("Row", QUERY_ROWS[0])
+    rows = [Row(**row) for row in QUERY_ROWS]
+
+    # Named rows and model instances read nothing useful, so they're refused
+    # rather than quietly giving back a table of empty columns.
+    with pytest.raises(TypeError):
+        get_signature_table_from_query(rows, QUERY_SIGNATURE)
+
+    with pytest.raises(TypeError):
+        get_signature_table_from_query(QUERY_ROWS, Row(**QUERY_ROWS[0]))
+
+
+def test_treeherder_query_from_query_rejects_missing_fields():
+    # The replicates are part of what a query selects, not an option, so
+    # leaving them out is refused like any other missing field.
+    for missing in (
+        "id",
+        "push_id",
+        "push_timestamp",
+        "value",
+        "performancedatumreplicate__value",
+    ):
+        rows = [{key: value for key, value in row.items() if key != missing} for row in QUERY_ROWS]
+
+        with pytest.raises(ValueError):
+            get_signature_table_from_query(rows, QUERY_SIGNATURE)
+
+
+def test_treeherder_query_from_query_no_data():
+    # A signature with nothing recent is an ordinary case when walking every
+    # signature, so it gives back an empty table rather than raising.
+    pushes = get_signature_table_from_query([], QUERY_SIGNATURE)
+
+    assert pushes.empty
+    assert list(pushes.columns) == [
+        "push_id",
+        "push_timestamp",
+        "revision",
+        "value",
+        "mean",
+        "values",
+        "trials",
+        "value_count",
+        "trial_count",
+    ]
+    assert pushes.attrs == QUERY_SIGNATURE
+
+
+def test_treeherder_query_from_query_feeds_timeseries():
+    timeseries = TreeherderTimeSeries(get_signature_table_from_query(QUERY_ROWS, QUERY_SIGNATURE))
+
+    assert timeseries.get_trials() == [9.0, 11.0, 10.5, 11.5, 13.0]
+    assert timeseries.lower_is_better is True
+    assert timeseries.alert_threshold == 2.0
+    assert timeseries.measurement_unit == "ms"
+    assert timeseries.revisions == {100: "revision100", 101: "revision101"}
+    assert list(timeseries.get_by_day()["trial_count"]) == [5]
+
+    # An empty series stays readable.
+    empty = TreeherderTimeSeries(get_signature_table_from_query([]))
+    assert empty.get_trials() == []
+
+
+def test_treeherder_query_fields_are_exported():
+    # A query is written with these, so they have to be reachable from the
+    # package itself rather than only from the module.
+    assert mozdetect.QUERY_FIELDS == QUERY_FIELDS
+
+    # Selecting them is what the helper takes, replicates included.
+    assert REPLICATE_FIELD in QUERY_FIELDS
+    assert set(QUERY_FIELDS) >= set(REQUIRED_DATUM_FIELDS)
+    assert list(QUERY_ROWS[0]) == list(QUERY_FIELDS)

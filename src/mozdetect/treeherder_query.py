@@ -10,9 +10,13 @@ data from anywhere. Nothing here writes.
 
 The data comes from `/api/performance/summary/` with `all_data=true`, the
 endpoint the Perfherder graphs view uses, which is what makes the replicates
-behind each data point reachable.
+behind each data point reachable. Code running inside Treeherder itself has the
+same data in the database rather than over HTTP, and can shape a query's rows
+into the same table with `get_signature_table_from_query`.
 """
 import logging
+
+from collections.abc import Mapping
 
 import pandas
 import requests
@@ -30,6 +34,56 @@ SIGNATURES_ENDPOINT = "/api/project/{project}/performance/signatures/"
 REQUEST_TIMEOUT = 120
 
 USER_AGENT = "mozdetect-treeherder-query"
+
+# The columns a table of data points is built with. Named here so a query
+# that selected nothing still gives back a table a detector can read; a table
+# read over the API carries whatever else the endpoint reports on top.
+DATUM_COLUMNS = [
+    "datum_id",
+    "job_id",
+    "push_id",
+    "push_timestamp",
+    "revision",
+    "value",
+    "trials",
+]
+
+# The same, once the data points have been collapsed into their pushes.
+PUSH_COLUMNS = [
+    "push_id",
+    "push_timestamp",
+    "revision",
+    "value",
+    "mean",
+    "values",
+    "trials",
+    "value_count",
+    "trial_count",
+]
+
+# The `values()` key each column is read from. Anything optional a query
+# leaves out comes back empty.
+DATUM_FIELDS = {
+    "datum_id": "id",
+    "job_id": "job_id",
+    "push_id": "push_id",
+    "push_timestamp": "push_timestamp",
+    "revision": "push__revision",
+    "value": "value",
+}
+
+# Selecting this joins the replicates in, one row per replicate.
+REPLICATE_FIELD = "performancedatumreplicate__value"
+
+# What a query selects: `.values(*QUERY_FIELDS)`. The replicate field is part
+# of it rather than an option, so a series is always compared on the finest
+# measurements the jobs recorded.
+QUERY_FIELDS = (*DATUM_FIELDS.values(), REPLICATE_FIELD)
+
+# Without these there's no series to build, so a query that missed one is
+# refused. `id` is what tells the joined rows of one data point apart from
+# the next, so the series collapses into a single point without it.
+REQUIRED_DATUM_FIELDS = ("id", "push_id", "push_timestamp", "value", REPLICATE_FIELD)
 
 logger = logging.getLogger("TreeherderQuery")
 
@@ -241,6 +295,153 @@ def get_signatures(
     )
 
 
+def _check_values_row(row, description):
+    """Checks that a row came from a Django `values()` query.
+
+    Rows are taken in one format only, so a query that hands back model
+    instances or named rows is caught here rather than quietly reading empty
+    columns out of them.
+
+    :param row: The row to check.
+    :param str description: What the row was expected to hold, for the error.
+    """
+    if not isinstance(row, Mapping):
+        raise TypeError(
+            f"Expecting {description} from a Django `values()` query, "
+            f"got {type(row).__name__}. Select the fields to read with "
+            "`.values(...)` rather than passing model instances or named rows."
+        )
+
+
+def _read_datum(datum):
+    """Reads one row of the query into the table's columns.
+
+    :param dict datum: A row of a `values()` query.
+
+    :return dict: The row's columns, with an empty `trials` to fill in.
+    """
+    _check_values_row(datum, "a data point")
+
+    missing = [name for name in REQUIRED_DATUM_FIELDS if name not in datum]
+    if missing:
+        raise ValueError(
+            f"The query didn't select {', '.join(missing)}, which the series is "
+            "built from. Select the fields with `.values(*QUERY_FIELDS)`."
+        )
+
+    row = {column: datum.get(name) for column, name in DATUM_FIELDS.items()}
+    # Filled in from the rows this data point was joined across.
+    row["trials"] = []
+
+    return row
+
+
+def _get_signature_metadata(signature):
+    """Reads the metadata a signature carries into the table's `attrs`.
+
+    This is what decides how a detected change gets interpreted, so it travels
+    with the data rather than being looked up again later. Whatever the
+    signature's own query selected is taken as it stands, under the names it
+    selected them with.
+
+    :param dict signature: The signature's fields, from a `values()` query.
+
+    :return dict: The signature's metadata.
+    """
+    if signature is None:
+        return {}
+
+    _check_values_row(signature, "a signature")
+
+    return dict(signature)
+
+
+def _finalize_table(result, metadata, per_push):
+    """Puts a table in the order and shape every reader expects.
+
+    :param pandas.DataFrame result: The table to finalize.
+    :param dict metadata: The signature metadata to carry on `attrs`.
+    :param bool per_push: Whether to collapse the table to one row per push.
+
+    :return pandas.DataFrame: The table, ordered oldest first.
+    """
+    result["push_timestamp"] = pandas.to_datetime(result["push_timestamp"])
+    if "submit_time" in result:
+        result["submit_time"] = pandas.to_datetime(result["submit_time"])
+
+    result = result.sort_values(by=["push_timestamp", "push_id"]).reset_index(drop=True)
+    result.attrs = metadata
+
+    if per_push:
+        return _aggregate_by_push(result)
+
+    return result
+
+
+def get_signature_table_from_query(datums, signature=None, per_push=True):
+    """Returns the timeseries a Django query selected, as `get_signature_table`
+    would have read it over HTTP.
+
+    For code running inside Treeherder, where the data is in the database
+    rather than behind the API. Both arguments are the rows of a `values()`
+    query, and nothing else::
+
+        datums = PerformanceDatum.objects.filter(
+            signature=signature, push_timestamp__gte=since
+        ).values(*QUERY_FIELDS)
+
+        signature_fields = (
+            PerformanceSignature.objects.filter(id=signature.id).values().first()
+        )
+
+        table = get_signature_table_from_query(datums, signature_fields)
+
+    `QUERY_FIELDS` always selects the replicates, which joins them in the way
+    Perfherder's own endpoint reads them: one row per replicate, with the data
+    point's fields repeated across them, and a null replicate value for the
+    jobs that didn't report any.
+
+    Everything the signature's own query selected becomes the metadata, under
+    the names it selected them with, so a bare `values()` gathers the lot. The
+    related rows are the exception: `values()` reports those as the ids they
+    are, so a query wanting the platform or repository by name has to ask for
+    `platform__platform` or `repository__name`.
+
+    :param datums: The rows to build the table from, as a `values(*QUERY_FIELDS)`
+        queryset or any iterable of its rows.
+    :param dict signature: The signature's fields, from a `values()` query.
+        They travel as they are on the table's `attrs`.
+    :param bool per_push: Whether to collapse the series to one row per push.
+        On by default, since change detection works over pushes, not jobs.
+
+    :return pandas.DataFrame: The series, ordered oldest first. One row per push,
+        or one row per data point when `per_push` is off. A query that selected
+        nothing gives an empty table that still carries the usual columns.
+    """
+    rows = {}
+    for datum in datums:
+        row = _read_datum(datum)
+        # The data point's own fields repeat across the rows its replicates
+        # were joined onto, so the first row it appears in is the one kept.
+        row = rows.setdefault(row["datum_id"], row)
+
+        replicate = datum.get(REPLICATE_FIELD)
+        if replicate is not None:
+            row["trials"].append(replicate)
+
+    # The measurements always land in `trials`, so what a detector compares
+    # is in the same place either way: a data point the query returned no
+    # replicates for falls back to the aggregated value it recorded.
+    for row in rows.values():
+        if not row["trials"]:
+            row["trials"] = [row["value"]]
+
+    result = pandas.DataFrame(
+        [row for row in rows.values() if row["value"] is not None], columns=DATUM_COLUMNS
+    )
+    return _finalize_table(result, _get_signature_metadata(signature), per_push)
+
+
 def _aggregate_by_push(dataframe):
     """Collapses a signature table down to one row per push.
 
@@ -250,8 +451,8 @@ def _aggregate_by_push(dataframe):
     kept in a `values` column, and the measurements behind them stay in the
     `trials` column they arrived in.
 
-    :param pandas.DataFrame dataframe: A table of data points, as
-        `get_signature_table` builds it.
+    :param pandas.DataFrame dataframe: A table of data points, as either of
+        the entry points above builds it.
 
     :return pandas.DataFrame: One row per push, ordered oldest first. The
         signature's metadata carries over from the given table's `attrs`.
@@ -275,10 +476,7 @@ def _aggregate_by_push(dataframe):
             }
         )
 
-    result = pandas.DataFrame(rows)
-    if result.empty:
-        return result
-
+    result = pandas.DataFrame(rows, columns=PUSH_COLUMNS)
     result = result.sort_values(by=["push_timestamp", "push_id"]).reset_index(drop=True)
     result.attrs = dict(dataframe.attrs)
 
@@ -357,9 +555,6 @@ def get_signature_table(
         )
 
     result = result.rename(columns={"id": "datum_id"})
-    result["push_timestamp"] = pandas.to_datetime(result["push_timestamp"])
-    if "submit_time" in result:
-        result["submit_time"] = pandas.to_datetime(result["submit_time"])
     # The measurements always land in `trials`, whether those are the
     # replicates behind each data point or the aggregated value standing in for
     # them, so what a detector compares is in the same place either way.
@@ -368,10 +563,8 @@ def get_signature_table(
         for datum_id, value in zip(result["datum_id"], result["value"])
     ]
 
-    result = result.sort_values(by=["push_timestamp", "push_id"]).reset_index(drop=True)
-    result.attrs = {key: value for key, value in aggregated.items() if key != "data"}
-
-    if per_push:
-        return _aggregate_by_push(result)
-
-    return result
+    return _finalize_table(
+        result,
+        {key: value for key, value in aggregated.items() if key != "data"},
+        per_push,
+    )

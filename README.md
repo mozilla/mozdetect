@@ -64,7 +64,25 @@ The key things to do in the script are calling `get_metric_table` to get the dat
 
 Timeseries data from Perfherder can be pulled from a Treeherder API server with `mozdetect.treeherder_query`, which works the same way as `telemetry_query` does for BigQuery, minus the login: the data is public and nothing is written, so it can be pointed at production from anywhere.
 
-Use `get_signatures` to help with finding series with specific characteristics, and `get_signature_table` to get the data for that series. The table holds one row per data point, with the replicates behind each point in a `replicates` column. The signature's metadata (e.g. `lower_is_better`, `alert_threshold`, etc.) are found on the frame's `attrs`. Since change detection usually works over pushes rather than jobs, and a push can hold several data points for the same signature (retriggers or backfills), the data is aggregated to have one row per push with all retriggers combined in them. Pass `per_push=False` to disable that behaviour.
+Use `get_signatures` to help with finding series with specific characteristics, and `get_signature_table` to get the data for that series. The table holds one row per data point, with the measurements behind each point in a `trials` column - the replicates when the jobs reported any, and the aggregated value standing in for them otherwise. The signature's metadata (e.g. `lower_is_better`, `alert_threshold`, etc.) are found on the frame's `attrs`. Since change detection usually works over pushes rather than jobs, and a push can hold several data points for the same signature (retriggers or backfills), the data is aggregated to have one row per push with all retriggers combined in them. Pass `per_push=False` to disable that behaviour.
+
+Both of those query the API. Code running inside Treeherder itself has the same data in the database, so `get_signature_table_from_query` builds the same table out of a Django query's rows instead, letting a technique developed here against production data run unchanged in alerting:
+```python
+from mozdetect import (
+    QUERY_FIELDS,
+    TreeherderTimeSeries,
+    get_signature_table_from_query,
+)
+
+datums = PerformanceDatum.objects.filter(
+    signature=signature, push_timestamp__gte=since
+).values(*QUERY_FIELDS)
+
+signature_fields = PerformanceSignature.objects.filter(id=signature.id).values().first()
+
+table = get_signature_table_from_query(datums, signature_fields)
+```
+Both arguments are the rows of a `values()` query. `QUERY_FIELDS` always selects the replicates, which joins them in the way Perfherder's own endpoint reads them: one row per replicate, with the data point's fields repeated across them, and a null replicate value for the jobs that didn't report any (those fall back to the aggregated value). Everything the signature's own query selected becomes the metadata on `attrs`, under the names it selected them with, so a bare `values()` gathers all the signature settings. Note that the related rows come back as the ids they are, so a query wanting the platform or repository by name has to ask for `platform__platform` or `repository__name`. Either table can then be handed to `TreeherderTimeSeries`.
 
 See `examples/treeherder_query_run.py` for a script that does both, which can be run using the following from the top-level of the repo:
 ```
