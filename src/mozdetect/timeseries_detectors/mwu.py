@@ -543,6 +543,7 @@ class MWUTimeSeriesDetector(
                     timestamp=sample.timestamp,
                     previous_location=previous.location if previous else None,
                     change=comparison.direction,
+                    is_high_confidence_better=False,
                     **comparison_info,
                 )
             )
