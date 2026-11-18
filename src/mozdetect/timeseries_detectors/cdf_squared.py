@@ -234,7 +234,7 @@ class CDFSquaredTimeSeriesDetector(
         combined = pandas.concat([fast, kept_smoothed], ignore_index=True)
         return combined.sort_values("date").reset_index(drop=True)
 
-    def _find_alerts(self, differences, alert_threshold=0.85):
+    def _find_alerts(self, differences, alert_threshold=0.87):
         start_date, end_date = self._coalesce_dates(
             differences["date"].min(), differences["date"].max()
         )
