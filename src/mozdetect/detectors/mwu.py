@@ -75,6 +75,8 @@ class MWUComparison:
     pvalue: float
     significance: str
     is_significant: bool
+    # "high", "medium", "low" or "very low" depending the p-value
+    confidence_level: str
     cliffs_delta: float
     cliffs_interpretation: str
     is_effect_meaningful: bool
@@ -215,6 +217,7 @@ class MWUDetector(BaseDetector, detector_name="mwu", detector_type="ci"):
             pvalue=pvalue,
             significance=significance,
             is_significant=is_significant,
+            confidence_level=mwu_stats.interpret_confidence(pvalue),
             cliffs_delta=cliffs_delta,
             cliffs_interpretation=cliffs_interpretation,
             is_effect_meaningful=is_effect_meaningful,

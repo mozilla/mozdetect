@@ -158,6 +158,49 @@ def test_pvalue_threshold_is_configurable():
     assert relaxed.direction == "regression"
 
 
+@pytest.mark.parametrize(
+    "trial_count, expected_level",
+    [
+        # Fully separated samples, so only how many values there are changes
+        # the p-value: ~0.0009, ~0.005 and ~0.03.
+        (8, "high"),
+        (6, "medium"),
+        (4, "low"),
+    ],
+)
+def test_compare_reports_a_confidence_level(trial_count, expected_level):
+    base = [float(value) for value in range(1, trial_count + 1)]
+    new = [float(value) for value in range(11, trial_count + 11)]
+
+    comparison = MWUDetector().detect_changes([base, new])
+
+    assert comparison.confidence_level == expected_level
+    assert comparison.as_dict()["confidence_level"] == expected_level
+
+
+def test_compare_reports_very_low_confidence_above_the_low_band():
+    rng = np.random.default_rng(7)
+    base = list(rng.normal(100, 2, 12))
+    new = list(rng.normal(100, 2, 12))
+
+    comparison = MWUDetector().detect_changes([base, new])
+
+    assert comparison.pvalue > 0.05
+    assert comparison.confidence_level == "very low"
+
+
+def test_confidence_level_ignores_the_pvalue_threshold():
+    # The level describes the p-value itself, so a run that asks for less
+    # evidence than the high band reports the changes it lets through as such.
+    base = [float(value) for value in range(1, 8)]
+    new = [float(value) for value in range(11, 18)]
+
+    comparison = MWUDetector().detect_changes([base, new], pvalue_threshold=0.05)
+
+    assert comparison.direction == "regression"
+    assert comparison.confidence_level == "medium"
+
+
 def test_cliffs_delta_threshold_is_configurable():
     # Heavily overlapping samples, but enough of them for a tiny p-value: only
     # the effect size stands between this and a detection.
@@ -298,6 +341,7 @@ def test_detects_a_step_in_a_series():
     assert info["delta_value"] == 0.5
     assert info["cliffs_interpretation"] == "large"
     assert info["significance"] == "significant"
+    assert info["confidence_level"] == "high"
     # Three pushes only carry 15 trials, so both windows grew until they held
     # MIN_TRIALS.
     assert info["base_count"] == MIN_TRIALS

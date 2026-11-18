@@ -22,6 +22,7 @@ from mozdetect.helpers.mwu_stats import (
     common_language_effect_size,
     direction_of_change,
     interpret_cles,
+    interpret_confidence,
     interpret_effect_size,
     interpret_significance,
     mann_whitney_u,
@@ -92,6 +93,24 @@ def test_interpret_significance():
     assert interpret_significance(0.05) == ("significant", True)
     assert interpret_significance(0.2) == ("not significant", False)
     assert interpret_significance(None) == ("", False)
+
+
+@pytest.mark.parametrize(
+    "pvalue, expected_level",
+    [
+        (0.0, "high"),
+        (0.001, "high"),
+        (0.0011, "medium"),
+        (0.01, "medium"),
+        (0.011, "low"),
+        (0.05, "low"),
+        (0.051, "very low"),
+        (1.0, "very low"),
+        (None, None),
+    ],
+)
+def test_interpret_confidence(pvalue, expected_level):
+    assert interpret_confidence(pvalue) == expected_level
 
 
 @pytest.mark.parametrize(

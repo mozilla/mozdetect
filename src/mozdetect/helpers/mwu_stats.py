@@ -34,6 +34,16 @@ from dataclasses import dataclass
 # distributions.
 PVALUE_THRESHOLD = 0.05
 
+# Bands for the confidence level strings
+HIGH_CONFIDENCE_PVALUE = 0.001
+MEDIUM_CONFIDENCE_PVALUE = 0.01
+LOW_CONFIDENCE_PVALUE = 0.05
+
+HIGH_CONFIDENCE = "high"
+MEDIUM_CONFIDENCE = "medium"
+LOW_CONFIDENCE = "low"
+VERY_LOW_CONFIDENCE = "very low"
+
 # Cliff's delta bands. PerfCompare's documentation describes a score past
 # +/-0.47 as a large difference and one near 0 as no real difference; anything
 # below the negligible bound isn't treated as a change at all, however small
@@ -243,6 +253,24 @@ def interpret_significance(pvalue, pvalue_threshold=PVALUE_THRESHOLD):
     if pvalue <= pvalue_threshold:
         return "significant", True
     return "not significant", False
+
+
+def interpret_confidence(pvalue):
+    """How confident a p-value lets us be that there's a change: "high" at or
+    below 0.001, "medium" up to 0.01, "low" up to 0.05, and "very low" above
+    that.
+
+    Returns None when there's no p-value.
+    """
+    if pvalue is None:
+        return None
+    if pvalue <= HIGH_CONFIDENCE_PVALUE:
+        return HIGH_CONFIDENCE
+    if pvalue <= MEDIUM_CONFIDENCE_PVALUE:
+        return MEDIUM_CONFIDENCE
+    if pvalue <= LOW_CONFIDENCE_PVALUE:
+        return LOW_CONFIDENCE
+    return VERY_LOW_CONFIDENCE
 
 
 def cliffs_delta(base, new):
